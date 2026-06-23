@@ -930,7 +930,8 @@ app.get('/health', (req, res) => {
         version: SERVER_VERSION,
         hasCookieSecretFile: fs.existsSync(process.env.YOUTUBE_COOKIES_FILE || '/etc/secrets/cookies.txt'),
         hasLocalCookiesFile: fs.existsSync(path.join(__dirname, 'cookies.txt')),
-        hasCookieEnv: Boolean(process.env.YOUTUBE_COOKIES_TXT || process.env.YOUTUBE_COOKIES || process.env.YOUTUBE_COOKIES_BASE64)
+        hasCookieEnv: Boolean(process.env.YOUTUBE_COOKIES_TXT || process.env.YOUTUBE_COOKIES || process.env.YOUTUBE_COOKIES_BASE64),
+        cookieRequiredForLegacyStream: true
     });
 });
 
@@ -1339,7 +1340,9 @@ app.get('/stream', async (req, res) => {
     } catch (err) {
         console.error(`[FUSION MUSIC] [PIPED] Streaming failed for ${videoId}:`, err.message);
         if (!res.headersSent) {
-            return res.status(502).send(`Piped streaming failed: ${err.message}`);
+            console.log(`[FUSION MUSIC] [PIPED] Falling back to legacy yt-dlp/play-dl stream for ${videoId}`);
+            req.url = req.originalUrl.replace('/stream', '/stream-legacy');
+            return app._router.handle(req, res);
         }
     }
 });
