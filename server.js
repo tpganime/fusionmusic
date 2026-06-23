@@ -8,6 +8,7 @@ const play = require('play-dl');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const SERVER_VERSION = 'fusion-render-stream-fix-2026-06-24-0318';
 
 app.set('trust proxy', true);
 app.disable('x-powered-by');
@@ -427,6 +428,7 @@ function streamWithYtdlpToResponse(req, res, videoUrl, formatSpec, format) {
     console.log(`[FUSION MUSIC] [YT-DLP PIPE] Streaming ${format.toUpperCase()} directly from yt-dlp stdout: ${cleanUrl}`);
     const ytdlp = spawn('yt-dlp', spawnArgs);
     let headersSent = false;
+    let bytesWritten = 0;
     let stderr = '';
 
     ytdlp.on('error', (err) => {
@@ -444,6 +446,7 @@ function streamWithYtdlpToResponse(req, res, videoUrl, formatSpec, format) {
     });
 
     ytdlp.stdout.on('data', (chunk) => {
+        if (!chunk || chunk.length === 0) return;
         if (!headersSent && !res.headersSent) {
             headersSent = true;
             res.writeHead(200, {
@@ -454,20 +457,25 @@ function streamWithYtdlpToResponse(req, res, videoUrl, formatSpec, format) {
                 'X-Accel-Buffering': 'no'
             });
         }
+        bytesWritten += chunk.length;
         res.write(chunk);
     });
 
     ytdlp.stdout.on('end', () => {
-        if (!res.closed) {
+        if (!headersSent && !res.headersSent) {
+            const message = stderr.trim() || 'yt-dlp produced zero bytes';
+            console.error(`[FUSION MUSIC] [YT-DLP PIPE] Empty stream: ${message}`);
+            res.status(500).send(`yt-dlp produced zero bytes: ${message}`);
+        } else if (!res.closed) {
             res.end();
         }
     });
 
     ytdlp.on('close', (code) => {
-        if (code !== 0) {
+        if (code !== 0 || bytesWritten === 0) {
             console.error(`[FUSION MUSIC] [YT-DLP PIPE] Failed with code ${code}: ${stderr.trim()}`);
             if (!headersSent && !res.headersSent) {
-                res.status(500).send(`yt-dlp stream failed: ${stderr.trim() || `exit code ${code}`}`);
+                res.status(500).send(`yt-dlp stream failed: ${stderr.trim() || `exit code ${code}, bytes=${bytesWritten}`}`);
             } else if (!res.closed) {
                 res.end();
             }
@@ -479,6 +487,195 @@ function streamWithYtdlpToResponse(req, res, videoUrl, formatSpec, format) {
             ytdlp.kill('SIGKILL');
         }
     });
+}
+
+const PIPED_API_BASES = [
+    'https://pipedapi.kavin.rocks',
+    'https://pipedapi.adminforge.de',
+    'https://api-piped.mha.fi',
+    'https://pipedapi.syncpundit.io'
+];
+
+let cachedPipedApiBases = null;
+let cachedPipedApiBasesAt = 0;
+
+function parseBitrate(value) {
+    if (typeof value === 'number') return value;
+    const text = String(value || '');
+    const match = text.match(/(\d+)/);
+    return match ? parseInt(match[1], 10) : 0;
+}
+
+function selectBestPipedAudioStream(audioStreams = []) {
+    const usable = audioStreams.filter(stream => stream && stream.url);
+    if (!usable.length) return null;
+
+    return usable
+        .map(stream => ({
+            stream,
+            score:
+                parseBitrate(stream.bitrate) +
+                parseBitrate(stream.quality) +
+                (String(stream.mimeType || '').includes('mp4') ? 500 : 0) +
+                (String(stream.format || '').includes('M4A') ? 300 : 0) +
+                (String(stream.codec || '').includes('mp4a') ? 200 : 0)
+        }))
+        .sort((a, b) => b.score - a.score)[0].stream;
+}
+
+async function resolvePipedAudioStream(videoId) {
+    const errors = [];
+
+    for (const base of await getPipedApiBases()) {
+        const endpoint = `${base}/streams/${encodeURIComponent(videoId)}`;
+        try {
+            console.log(`[FUSION MUSIC] [PIPED] Resolving streams from ${endpoint}`);
+            const response = await fetch(endpoint, {
+                headers: {
+                    'Accept': 'application/json',
+                    'User-Agent': 'FusionMusic-Backend/1.0'
+                },
+                signal: AbortSignal.timeout(20_000)
+            });
+
+            if (!response.ok) {
+                const text = await response.text().catch(() => '');
+                errors.push(`${base}: HTTP ${response.status} ${text.slice(0, 140)}`);
+                continue;
+            }
+
+            const data = await response.json();
+            const audio = selectBestPipedAudioStream(data.audioStreams || []);
+            if (!audio || !audio.url) {
+                errors.push(`${base}: no playable audioStreams`);
+                continue;
+            }
+
+            return {
+                url: audio.url,
+                mimeType: audio.mimeType || audio.format || 'audio/mp4',
+                source: base,
+                title: data.title || '',
+                quality: audio.quality || audio.bitrate || ''
+            };
+        } catch (err) {
+            errors.push(`${base}: ${err.message}`);
+        }
+    }
+
+    throw new Error(`Piped audio stream resolution failed. ${errors.join(' | ')}`);
+}
+
+async function getPipedApiBases() {
+    if (cachedPipedApiBases && Date.now() - cachedPipedApiBasesAt < 30 * 60 * 1000) {
+        return cachedPipedApiBases;
+    }
+
+    const bases = new Set();
+    const envBases = String(process.env.PIPED_API_BASES || '')
+        .split(',')
+        .map(value => value.trim().replace(/\/$/, ''))
+        .filter(Boolean);
+
+    envBases.forEach(base => bases.add(base));
+    PIPED_API_BASES.forEach(base => bases.add(base));
+
+    try {
+        const response = await fetch('https://piped-instances.kavin.rocks/', {
+            headers: {
+                'Accept': 'application/json',
+                'User-Agent': 'FusionMusic-Backend/1.0'
+            },
+            signal: AbortSignal.timeout(10_000)
+        });
+        if (response.ok) {
+            const instances = await response.json();
+            if (Array.isArray(instances)) {
+                instances
+                    .map(instance => String(instance.api_url || '').trim().replace(/\/$/, ''))
+                    .filter(Boolean)
+                    .forEach(base => bases.add(base));
+            }
+        }
+    } catch (err) {
+        console.warn(`[FUSION MUSIC] [PIPED] Failed to refresh public instance list:`, err.message);
+    }
+
+    cachedPipedApiBases = [...bases];
+    cachedPipedApiBasesAt = Date.now();
+    return cachedPipedApiBases;
+}
+
+function proxyResolvedMediaUrl(req, res, mediaUrl, fallbackContentType = 'audio/mp4') {
+    const parsedUrl = url.parse(mediaUrl);
+    const transport = parsedUrl.protocol === 'http:' ? require('http') : https;
+    const headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Connection': 'keep-alive'
+    };
+
+    if (req.headers.range) {
+        headers['Range'] = req.headers.range;
+    }
+
+    const options = {
+        hostname: parsedUrl.hostname,
+        path: parsedUrl.path,
+        method: 'GET',
+        headers,
+        rejectUnauthorized: false,
+        agent: parsedUrl.protocol === 'http:' ? undefined : httpsAgent
+    };
+
+    const proxyReq = transport.request(options, (proxyRes) => {
+        if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
+            proxyRes.resume();
+            return proxyResolvedMediaUrl(req, res, proxyRes.headers.location, fallbackContentType);
+        }
+
+        if (res.headersSent || res.closed) {
+            proxyRes.resume();
+            proxyReq.destroy();
+            return;
+        }
+
+        res.status(proxyRes.statusCode || 200);
+        res.setHeader('Content-Type', proxyRes.headers['content-type'] || fallbackContentType);
+
+        [
+            'content-length',
+            'content-range',
+            'accept-ranges',
+            'content-encoding',
+            'cache-control',
+            'etag',
+            'last-modified'
+        ].forEach(header => {
+            if (proxyRes.headers[header] && !res.headersSent) {
+                res.setHeader(header, proxyRes.headers[header]);
+            }
+        });
+
+        proxyRes.pipe(res);
+    });
+
+    proxyReq.on('error', (err) => {
+        console.error(`[FUSION MUSIC] [PIPED] Proxy error:`, err.message);
+        if (!res.headersSent) {
+            res.status(502).send(`Piped audio proxy failed: ${err.message}`);
+        } else if (!res.closed) {
+            res.end();
+        }
+    });
+
+    res.on('close', () => {
+        if (!res.writableEnded) {
+            proxyReq.destroy();
+        }
+    });
+
+    proxyReq.end();
 }
 
 function downloadToCache(videoUrl, formatSpec, cacheKey, filePath, tempFilePath) {
@@ -706,6 +903,7 @@ setInterval(cleanCache, 6 * 60 * 60 * 1000);
 // Cloudflare Tunnel / browser preflight compatibility.
 app.use((req, res, next) => {
     const origin = req.headers.origin || '*';
+    res.setHeader('X-Fusion-Server-Version', SERVER_VERSION);
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -728,7 +926,11 @@ app.get('/health', (req, res) => {
     res.json({
         ok: true,
         service: 'fusion-music',
-        tunnel: req.headers['cf-ray'] ? 'cloudflare' : 'direct'
+        tunnel: req.headers['cf-ray'] ? 'cloudflare' : 'direct',
+        version: SERVER_VERSION,
+        hasCookieSecretFile: fs.existsSync(process.env.YOUTUBE_COOKIES_FILE || '/etc/secrets/cookies.txt'),
+        hasLocalCookiesFile: fs.existsSync(path.join(__dirname, 'cookies.txt')),
+        hasCookieEnv: Boolean(process.env.YOUTUBE_COOKIES_TXT || process.env.YOUTUBE_COOKIES || process.env.YOUTUBE_COOKIES_BASE64)
     });
 });
 
@@ -736,6 +938,7 @@ app.get('/', (req, res) => {
     res.json({
         ok: true,
         service: 'fusion-music',
+        version: SERVER_VERSION,
         endpoints: ['/search?q=QUERY', '/stream?url=YOUTUBE_URL', '/playlist?url=PLAYLIST_URL', '/preload?urls=URLS']
     });
 });
@@ -1114,8 +1317,35 @@ app.get('/preload', async (req, res) => {
     res.send('Preload queued');
 });
 
-// STREAMING ENDPOINT - Default FFmpeg engine with direct proxy fallback
+// STREAMING ENDPOINT - Piped API audio resolver and direct proxy
 app.get('/stream', async (req, res) => {
+    const videoUrl = req.query.url;
+    if (!videoUrl) return res.status(400).send('Missing url parameter');
+
+    const videoId = extractVideoId(videoUrl);
+    if (!videoId || videoId.length < 6) {
+        return res.status(400).send('Invalid YouTube url parameter');
+    }
+
+    try {
+        const pipedAudio = await resolvePipedAudioStream(videoId);
+        console.log(
+            `[FUSION MUSIC] [PIPED] Proxying audio stream for ${videoId} from ${pipedAudio.source}` +
+            `${pipedAudio.quality ? ` quality=${pipedAudio.quality}` : ''}`
+        );
+        res.setHeader('X-Fusion-Stream-Source', 'piped');
+        res.setHeader('X-Fusion-Piped-Source', pipedAudio.source);
+        return proxyResolvedMediaUrl(req, res, pipedAudio.url, pipedAudio.mimeType || 'audio/mp4');
+    } catch (err) {
+        console.error(`[FUSION MUSIC] [PIPED] Streaming failed for ${videoId}:`, err.message);
+        if (!res.headersSent) {
+            return res.status(502).send(`Piped streaming failed: ${err.message}`);
+        }
+    }
+});
+
+// LEGACY STREAMING ENDPOINT - kept for fallback/manual diagnostics only
+app.get('/stream-legacy', async (req, res) => {
     const videoUrl = req.query.url;
     const format = req.query.format || 'audio';
     const quality = (req.query.quality || 'high').toLowerCase();
