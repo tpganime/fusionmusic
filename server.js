@@ -78,12 +78,57 @@ const directUrlCache = {
 
 // Helper to inject cookies if a cookies.txt file exists in the directory
 function getYtdlpArgs(baseArgs) {
+    const secretCookiesPath = process.env.YOUTUBE_COOKIES_FILE || '/etc/secrets/cookies.txt';
+    if (fs.existsSync(secretCookiesPath)) {
+        console.log(`[FUSION MUSIC] Using YouTube cookies secret file for yt-dlp request.`);
+        return [...baseArgs, '--cookies', secretCookiesPath];
+    }
+
+    const envCookiesPath = materializeCookiesFromEnv();
+    if (envCookiesPath) {
+        console.log(`[FUSION MUSIC] Using YouTube cookies from Render environment for yt-dlp request.`);
+        return [...baseArgs, '--cookies', envCookiesPath];
+    }
+
     const cookiesPath = path.join(__dirname, 'cookies.txt');
     if (fs.existsSync(cookiesPath)) {
         console.log(`[FUSION MUSIC] Using cookies.txt for yt-dlp request.`);
         return [...baseArgs, '--cookies', cookiesPath];
     }
     return baseArgs;
+}
+
+function materializeCookiesFromEnv() {
+    const targetPath = path.join(__dirname, 'cookies.txt');
+    if (fs.existsSync(targetPath)) {
+        return null;
+    }
+
+    const rawCookies = process.env.YOUTUBE_COOKIES_TXT || process.env.YOUTUBE_COOKIES || '';
+    const base64Cookies = process.env.YOUTUBE_COOKIES_BASE64 || '';
+    let cookieText = '';
+
+    if (rawCookies.trim()) {
+        cookieText = rawCookies.replace(/\\n/g, '\n').trim();
+    } else if (base64Cookies.trim()) {
+        try {
+            cookieText = Buffer.from(base64Cookies.trim(), 'base64').toString('utf8').trim();
+        } catch (err) {
+            console.error(`[FUSION MUSIC] Failed to decode YOUTUBE_COOKIES_BASE64:`, err.message);
+        }
+    }
+
+    if (!cookieText) {
+        return null;
+    }
+
+    try {
+        fs.writeFileSync(targetPath, cookieText.endsWith('\n') ? cookieText : `${cookieText}\n`, { mode: 0o600 });
+        return targetPath;
+    } catch (err) {
+        console.error(`[FUSION MUSIC] Failed to write Render cookies.txt:`, err.message);
+        return null;
+    }
 }
 
 // Semaphore to prevent CPU thrashing by limiting concurrent yt-dlp executions
@@ -210,8 +255,9 @@ function resolveWithYtdlp(videoUrl, formatSpec) {
                 '--no-warnings',
                 '--no-cache-dir',
                 '--no-check-formats',
+                '--force-ipv4',
                 '--socket-timeout', '10',
-                '--extractor-args', 'youtube:player_client=android,web',
+                '--extractor-args', 'youtube:player_client=android,ios,web',
                 cleanUrl
             ]);
 

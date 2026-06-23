@@ -13,15 +13,11 @@ RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o 
     && chmod a+rx /usr/local/bin/yt-dlp
 
 WORKDIR /app
-
 COPY package*.json ./
 RUN npm install
-
-# Fixed into a single line
 COPY . .
 
-# Changed to match your server.js port 3000
-EXPOSE 3000
-ENV PORT=3000
+EXPOSE 7860
+ENV PORT=7860
 
 CMD ["node", "server.js"]
