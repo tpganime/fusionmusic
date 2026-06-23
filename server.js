@@ -1265,4 +1265,4 @@ app.get('/stream', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => console.log(`[FUSION MUSIC] Core backend engine running on port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`[FUSION MUSIC] Core backend engine running on port ${PORT}`));
