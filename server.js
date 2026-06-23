@@ -405,6 +405,82 @@ function downloadUrlToFile(directUrl, userAgent, tempFilePath, rangeHeader = nul
     });
 }
 
+function streamWithYtdlpToResponse(req, res, videoUrl, formatSpec, format) {
+    const videoId = extractVideoId(videoUrl);
+    const cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const contentType = format === 'video' ? 'video/mp4' : 'audio/mp4';
+    const spawnArgs = getYtdlpArgs([
+        '-f', formatSpec,
+        '-o', '-',
+        '--no-config',
+        '--no-playlist',
+        '--no-check-certificate',
+        '--no-warnings',
+        '--no-cache-dir',
+        '--no-part',
+        '--force-ipv4',
+        '--socket-timeout', '20',
+        '--extractor-args', 'youtube:player_client=android,ios,web',
+        cleanUrl
+    ]);
+
+    console.log(`[FUSION MUSIC] [YT-DLP PIPE] Streaming ${format.toUpperCase()} directly from yt-dlp stdout: ${cleanUrl}`);
+    const ytdlp = spawn('yt-dlp', spawnArgs);
+    let headersSent = false;
+    let stderr = '';
+
+    ytdlp.on('error', (err) => {
+        console.error(`[FUSION MUSIC] [YT-DLP PIPE] Spawn failed:`, err.message);
+        if (!headersSent && !res.headersSent) {
+            res.status(500).send(`yt-dlp stream spawn failed: ${err.message}`);
+        } else if (!res.closed) {
+            res.end();
+        }
+    });
+
+    ytdlp.stderr.on('data', (data) => {
+        stderr += data.toString();
+        if (stderr.length > 6000) stderr = stderr.slice(-6000);
+    });
+
+    ytdlp.stdout.on('data', (chunk) => {
+        if (!headersSent && !res.headersSent) {
+            headersSent = true;
+            res.writeHead(200, {
+                'Content-Type': contentType,
+                'Cache-Control': 'no-store, no-transform',
+                'Accept-Ranges': 'none',
+                'Transfer-Encoding': 'chunked',
+                'X-Accel-Buffering': 'no'
+            });
+        }
+        res.write(chunk);
+    });
+
+    ytdlp.stdout.on('end', () => {
+        if (!res.closed) {
+            res.end();
+        }
+    });
+
+    ytdlp.on('close', (code) => {
+        if (code !== 0) {
+            console.error(`[FUSION MUSIC] [YT-DLP PIPE] Failed with code ${code}: ${stderr.trim()}`);
+            if (!headersSent && !res.headersSent) {
+                res.status(500).send(`yt-dlp stream failed: ${stderr.trim() || `exit code ${code}`}`);
+            } else if (!res.closed) {
+                res.end();
+            }
+        }
+    });
+
+    req.on('close', () => {
+        if (!ytdlp.killed) {
+            ytdlp.kill('SIGKILL');
+        }
+    });
+}
+
 function downloadToCache(videoUrl, formatSpec, cacheKey, filePath, tempFilePath) {
     if (activeDownloads.has(cacheKey)) {
         return activeDownloads.get(cacheKey);
@@ -1296,7 +1372,7 @@ app.get('/stream', async (req, res) => {
                 if (attempts < maxAttempts) {
                     tryProxyStream(true);
                 } else if (!res.headersSent) {
-                    res.status(500).send('Streaming resolution failed');
+                    return streamWithYtdlpToResponse(req, res, videoUrl, formatSpec, format);
                 }
             }
         }
@@ -1306,7 +1382,7 @@ app.get('/stream', async (req, res) => {
     } catch (err) {
         console.error(`[FUSION MUSIC] Streaming failed:`, err.message);
         if (!res.headersSent) {
-            res.status(500).send('Streaming failed: ' + err.message);
+            return streamWithYtdlpToResponse(req, res, videoUrl, formatSpec, format);
         }
     }
 });
