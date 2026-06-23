@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "rewrites": [
+    {
+      "source": "/stream",
+      "destination": "/api/stream"
+    },
+    {
+      "source": "/health",
+      "destination": "/api/stream?route=health"
+    }
+  ],
+  "functions": {
+    "api/stream.js": {
+      "maxDuration": 60
+    }
+  }
+}
