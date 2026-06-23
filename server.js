@@ -474,8 +474,8 @@ function streamWithYtdlpToResponse(req, res, videoUrl, formatSpec, format) {
         }
     });
 
-    req.on('close', () => {
-        if (!ytdlp.killed) {
+    res.on('close', () => {
+        if (!res.writableEnded && !ytdlp.killed) {
             ytdlp.kill('SIGKILL');
         }
     });
@@ -1194,8 +1194,10 @@ app.get('/stream', async (req, res) => {
                     });
                     preloadStream.pipe(res);
                      
-                    req.on('close', () => {
-                        preloadStream.destroy();
+                    res.on('close', () => {
+                        if (!res.writableEnded) {
+                            preloadStream.destroy();
+                        }
                     });
                     return;
                 } else if (startByte < preloadSize) {
@@ -1250,9 +1252,11 @@ app.get('/stream', async (req, res) => {
                 console.error(`[FUSION MUSIC] [FFMPEG] Process error:`, err.message);
             });
 
-            req.on('close', () => {
-                console.log(`[FUSION MUSIC] [FFMPEG] Client closed stream, cleaning up FFmpeg process.`);
-                ffmpegProcess.kill('SIGKILL');
+            res.on('close', () => {
+                if (!res.writableEnded) {
+                    console.log(`[FUSION MUSIC] [FFMPEG] Client closed stream, cleaning up FFmpeg process.`);
+                    ffmpegProcess.kill('SIGKILL');
+                }
             });
             
             return;
@@ -1358,8 +1362,10 @@ app.get('/stream', async (req, res) => {
                         }
                     });
 
-                    req.on('close', () => {
-                        proxyReq.destroy();
+                    res.on('close', () => {
+                        if (!res.writableEnded) {
+                            proxyReq.destroy();
+                        }
                     });
 
                     proxyReq.end();
